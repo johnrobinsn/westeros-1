@@ -21,17 +21,32 @@
 #include <memory.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 #include <map>
+#include <vector>
 
 #include "westeros-nested.h"
 #include "simpleshell-client-protocol.h"
+#include "vpc-client-protocol.h"
 
 #ifdef ENABLE_SBPROTOCOL
 #include "simplebuffer-client-protocol.h"
 #endif
 
 #define WST_UNUSED(x) ((void)(x))
+
+typedef struct _WstNestedSurfaceInfo
+{
+   struct wl_surface *surface;
+   struct wl_buffer *buffer;
+} WstNestedSurfaceInfo;
+
+typedef struct _WstNestedBufferInfo
+{
+   struct wl_surface *surface;
+   struct wl_resource *bufferRemote;
+} WstNestedBufferInfo;
 
 typedef struct _WstNestedConnection
 {
@@ -41,6 +56,7 @@ typedef struct _WstNestedConnection
    struct wl_compositor *compositor;
    struct wl_output *output;
    struct wl_shm *shm;
+   struct wl_vpc *vpc;
    struct wl_simple_shell *simpleShell;
    #ifdef ENABLE_SBPROTOCOL
    struct wl_sb *sb;
@@ -57,8 +73,12 @@ typedef struct _WstNestedConnection
    bool started;
    bool stopRequested;
    pthread_t nestedThreadId;
+   pthread_mutex_t buffersToReleaseMutex;
    uint32_t pointerEnterSerial;
+   std::vector<WstNestedBufferInfo> buffersToRelease;
    std::map<struct wl_surface*, int32_t> surfaceMap;
+   std::map<struct wl_surface*, WstNestedSurfaceInfo*> surfaceInfoMap;
+   std::map<struct wl_vpc_surface*, struct wl_surface*> vpcSurfaceMap;
 } WstNestedConnection;
 
 static void outputHandleGeometry( void *data, 
@@ -196,8 +216,8 @@ static void keyboardHandleModifiers( void *data, struct wl_keyboard *keyboard,
    if ( nc->nestedListener )
    {
       nc->nestedListener->keyboardHandleModifiers( nc->nestedListenerUserData,
-                                                         mods_depressed, mods_latched,
-                                                         mods_locked, group );
+                                                   mods_depressed, mods_latched,
+                                                   mods_locked, group );
    }
 }
 
@@ -292,6 +312,59 @@ static const struct wl_pointer_listener pointerListener= {
    pointerHandleAxis
 };
 
+static void touchHandleDown( void *data, struct wl_touch *touch,
+                             uint32_t serial, uint32_t time, struct wl_surface *surface,
+                             int32_t id, wl_fixed_t sx, wl_fixed_t sy )
+{
+   WstNestedConnection *nc= (WstNestedConnection*)data;
+
+   if ( nc->nestedListener )
+   {
+      nc->nestedListener->touchHandleDown( nc->nestedListenerUserData,
+                                           surface, time, id, sx, sy );
+   }
+}
+
+static void touchHandleUp( void *data, struct wl_touch *touch,
+                           uint32_t serial, uint32_t time, int32_t id )
+{
+   WstNestedConnection *nc= (WstNestedConnection*)data;
+
+   if ( nc->nestedListener )
+   {
+      nc->nestedListener->touchHandleUp( nc->nestedListenerUserData, time, id );
+   }
+}
+
+static void touchHandleMotion( void *data, struct wl_touch *touch,
+                               uint32_t time, int32_t id, wl_fixed_t sx, wl_fixed_t sy )
+{
+   WstNestedConnection *nc= (WstNestedConnection*)data;
+
+   if ( nc->nestedListener )
+   {
+      nc->nestedListener->touchHandleMotion( nc->nestedListenerUserData,
+                                             time, id, sx, sy );
+   }
+}
+
+static void touchHandleFrame( void *data, struct wl_touch *touch )
+{
+   WstNestedConnection *nc= (WstNestedConnection*)data;
+
+   if ( nc->nestedListener )
+   {
+      nc->nestedListener->touchHandleFrame( nc->nestedListenerUserData );
+   }
+}
+
+static const struct wl_touch_listener touchListener= {
+   touchHandleDown,
+   touchHandleUp,
+   touchHandleMotion,
+   touchHandleFrame
+};
+
 static void seatCapabilities( void *data, struct wl_seat *seat, uint32_t capabilities )
 {
 	WstNestedConnection *nc = (WstNestedConnection*)data;
@@ -309,6 +382,7 @@ static void seatCapabilities( void *data, struct wl_seat *seat, uint32_t capabil
    if ( capabilities & WL_SEAT_CAPABILITY_TOUCH )
    {
       nc->touch= wl_seat_get_touch( nc->seat );
+      wl_touch_add_listener( nc->touch, &touchListener, nc );
    }   
    wl_display_roundtrip( nc->display );
 }
@@ -347,6 +421,64 @@ static void shmFormat( void *data, struct wl_shm *shm, uint32_t format )
 
 static const struct wl_shm_listener shmListener = {
    shmFormat
+};
+static void vpcVideoPathChange(void *data,
+                               struct wl_vpc_surface *vpcSurface,
+                               uint32_t new_pathway )
+{
+   WST_UNUSED(vpcSurface);
+	WstNestedConnection *nc = (WstNestedConnection*)data;
+
+   if ( nc->nestedListener )
+   {
+      std::map<struct wl_vpc_surface*,struct wl_surface*>::iterator it= nc->vpcSurfaceMap.find( vpcSurface );
+      if ( it != nc->vpcSurfaceMap.end() )
+      {
+         struct wl_surface *surface= it->second;
+         nc->nestedListener->vpcVideoPathChange( nc->nestedListenerUserData,
+                                                 surface,
+                                                 new_pathway );
+      }
+   }
+}                               
+
+static void vpcVideoXformChange(void *data,
+                                struct wl_vpc_surface *vpcSurface,
+                                int32_t x_translation,
+                                int32_t y_translation,
+                                uint32_t x_scale_num,
+                                uint32_t x_scale_denom,
+                                uint32_t y_scale_num,
+                                uint32_t y_scale_denom,
+                                uint32_t output_width,
+                                uint32_t output_height )
+{                                
+   WST_UNUSED(vpcSurface);
+	WstNestedConnection *nc = (WstNestedConnection*)data;
+
+   if ( nc->nestedListener )
+   {
+      std::map<struct wl_vpc_surface*,struct wl_surface*>::iterator it= nc->vpcSurfaceMap.find( vpcSurface );
+      if ( it != nc->vpcSurfaceMap.end() )
+      {
+         struct wl_surface *surface= it->second;
+         nc->nestedListener->vpcVideoXformChange( nc->nestedListenerUserData,
+                                                  surface,
+                                                  x_translation,
+                                                  y_translation,
+                                                  x_scale_num,
+                                                  x_scale_denom,
+                                                  y_scale_num,
+                                                  y_scale_denom,
+                                                  output_width,
+                                                  output_height );
+      }
+   }
+}
+
+static const struct wl_vpc_surface_listener vpcListener= {
+   vpcVideoPathChange,
+   vpcVideoXformChange
 };
 
 #ifdef ENABLE_SBPROTOCOL
@@ -457,6 +589,9 @@ static void registryHandleGlobal(void *data,
 		wl_seat_add_listener(nc->seat, &seatListener, nc);
 		wl_display_roundtrip( nc->display );
    } 
+   else if ( (len==6) && !strncmp(interface, "wl_vpc", len) ) {
+      nc->vpc= (struct wl_vpc*)wl_registry_bind(registry, id, &wl_vpc_interface, 1);
+   }
    else if ( (len==6) && !strncmp(interface, "wl_shm", len) ) {
       nc->shm= (struct wl_shm*)wl_registry_bind(registry, id, &wl_shm_interface, 1);
       wl_shm_add_listener(nc->shm, &shmListener, nc);
@@ -493,7 +628,12 @@ static void* wstNestedThread( void *data )
    WstNestedConnection *nc= (WstNestedConnection*)data;
    
    nc->started= true;
-   
+
+   if ( nc->nestedListener )
+   {
+      nc->nestedListener->connectionStarted( nc->nestedListenerUserData );
+   }
+
    while ( !nc->stopRequested )
    {
       if ( wl_display_dispatch( nc->display ) == -1 )
@@ -504,10 +644,12 @@ static void* wstNestedThread( void *data )
    }
  
    nc->started= false;
-   if ( !nc->stopRequested )
+   if ( nc->nestedListener && !nc->stopRequested )
    {
       nc->nestedListener->connectionEnded( nc->nestedListenerUserData );
    }
+
+   return NULL;
 }
 
 WstNestedConnection* WstNestedConnectionCreate( WstCompositor *wctx, 
@@ -529,6 +671,10 @@ WstNestedConnection* WstNestedConnectionCreate( WstCompositor *wctx,
       nc->nestedListener= listener;
       
       nc->surfaceMap= std::map<struct wl_surface*, int32_t>();
+      nc->surfaceInfoMap= std::map<struct wl_surface*, WstNestedSurfaceInfo*>();
+      nc->vpcSurfaceMap= std::map<struct wl_vpc_surface*, struct wl_surface*>();
+      nc->buffersToRelease= std::vector<WstNestedBufferInfo>();
+      pthread_mutex_init( &nc->buffersToReleaseMutex, 0 );
 
       nc->display= wl_display_connect( displayName );
       if ( !nc->display )
@@ -603,8 +749,11 @@ void WstNestedConnectionDisconnect( WstNestedConnection *nc )
       if ( nc->started )
       {
          nc->stopRequested= true;
-         wl_display_flush( nc->display );
-         wl_display_roundtrip( nc->display );
+         int fd= wl_display_get_fd( nc->display );
+         if ( fd >= 0 )
+         {
+            shutdown( fd, SHUT_RDWR );
+         }
          pthread_join( nc->nestedThreadId, NULL );
       }
    }
@@ -618,8 +767,11 @@ void WstNestedConnectionDestroy( WstNestedConnection *nc )
       if ( threadStarted )
       {
          nc->stopRequested= true;
-         wl_display_flush( nc->display );
-         wl_display_roundtrip( nc->display );
+         int fd= wl_display_get_fd( nc->display );
+         if ( fd >= 0 )
+         {
+            shutdown( fd, SHUT_RDWR );
+         }
          pthread_join( nc->nestedThreadId, NULL );
       }
       if ( nc->touch )
@@ -641,6 +793,11 @@ void WstNestedConnectionDestroy( WstNestedConnection *nc )
       {
          wl_surface_destroy( nc->surface );
          nc->surface= 0;
+      }
+      if ( nc->vpc )
+      {
+         wl_vpc_destroy( nc->vpc );
+         nc->vpc= 0;
       }
       if ( nc->shm )
       {
@@ -677,6 +834,7 @@ void WstNestedConnectionDestroy( WstNestedConnection *nc )
          nc->display= 0;
       }
       nc->surfaceMap.clear();
+      pthread_mutex_destroy( &nc->buffersToReleaseMutex );
       free( nc );
    }
 }
@@ -711,7 +869,16 @@ struct wl_surface* WstNestedConnectionCreateSurface( WstNestedConnection *nc )
    
    if ( nc && nc->compositor )
    {
+      WstNestedSurfaceInfo *surfaceInfo;
+      
       surface= wl_compositor_create_surface(nc->compositor);
+      surfaceInfo= (WstNestedSurfaceInfo*)malloc( sizeof(WstNestedSurfaceInfo) );
+      if ( surfaceInfo )
+      {
+         surfaceInfo->surface= surface;
+         surfaceInfo->buffer= 0;
+         nc->surfaceInfoMap.insert( std::pair<struct wl_surface*,WstNestedSurfaceInfo*>( surface, surfaceInfo ) );     
+      }
       wl_display_flush( nc->display );      
    }
    
@@ -722,15 +889,71 @@ void WstNestedConnectionDestroySurface( WstNestedConnection *nc, struct wl_surfa
 {
    if ( surface )
    {
-      for( std::map<struct wl_surface*,int32_t>::iterator it= nc->surfaceMap.begin(); it != nc->surfaceMap.end(); ++it )
       {
-         if ( it->first == surface )
+         std::map<struct wl_surface*,int32_t>::iterator it= nc->surfaceMap.find( surface );
+         if ( it != nc->surfaceMap.end() )
          {
             nc->surfaceMap.erase(it);
-            break;
          }
       }
+      {
+         std::map<struct wl_surface*,WstNestedSurfaceInfo*>::iterator it= nc->surfaceInfoMap.find( surface );
+         if ( it != nc->surfaceInfoMap.end() )
+         {
+            WstNestedSurfaceInfo *surfaceInfo= it->second;
+            if ( surfaceInfo->buffer )
+            {
+               wl_buffer_destroy( surfaceInfo->buffer );
+            }
+            free( surfaceInfo );
+            nc->surfaceInfoMap.erase(it);
+         }
+      }
+      {
+         pthread_mutex_lock( &nc->buffersToReleaseMutex );
+         for ( std::vector<WstNestedBufferInfo>::iterator it= nc->buffersToRelease.begin();
+               it != nc->buffersToRelease.end(); )
+         {
+            if ( surface == (*it).surface )
+               it = nc->buffersToRelease.erase(it);
+            else
+                ++it;
+         }         
+         pthread_mutex_unlock( &nc->buffersToReleaseMutex );
+      }
       wl_surface_destroy( surface );
+      wl_display_flush( nc->display );      
+   }
+}
+
+struct wl_vpc_surface* WstNestedConnectionGetVpcSurface( WstNestedConnection *nc, struct wl_surface *surface )
+{
+   struct wl_vpc_surface *vpcSurface= 0;
+   
+   if ( nc && nc->vpc )
+   {
+      vpcSurface= wl_vpc_get_vpc_surface( nc->vpc, surface );
+      if ( vpcSurface )
+      {
+         wl_vpc_surface_add_listener( vpcSurface, &vpcListener, nc );
+         
+         nc->vpcSurfaceMap.insert( std::pair<struct wl_vpc_surface*,struct wl_surface*>( vpcSurface, surface ) );     
+      }
+   }
+   
+   return vpcSurface;
+}
+
+void WstNestedConnectionDestroyVpcSurface( WstNestedConnection *nc, struct wl_vpc_surface *vpcSurface )
+{
+   if ( vpcSurface )
+   {
+      std::map<struct wl_vpc_surface*,struct wl_surface*>::iterator it= nc->vpcSurfaceMap.find( vpcSurface );
+      if ( it != nc->vpcSurfaceMap.end() )
+      {
+         nc->vpcSurfaceMap.erase(it);
+      }
+      wl_vpc_surface_destroy( vpcSurface );
       wl_display_flush( nc->display );      
    }
 }
@@ -814,22 +1037,45 @@ void WstNestedConnectionAttachAndCommit( WstNestedConnection *nc,
 {
    if ( nc )
    {
-      wl_surface_attach( surface, buffer, 0, 0 );
+      wl_surface_attach( surface, buffer, x, y );
       wl_surface_damage( surface, x, y, width, height);
       wl_surface_commit( surface );
       wl_display_flush( nc->display );      
    }
 }                                          
 
+typedef struct bufferInfo
+{
+   WstNestedConnection *nc;
+   struct wl_surface *surface;
+   struct wl_resource *bufferRemote;
+} bufferInfo;
+
 static void buffer_release( void *data, struct wl_buffer *buffer )
 {
-   struct wl_resource *bufferRemote= (struct wl_resource*)data;
+   bufferInfo *binfo= (bufferInfo*)data;
    
    wl_buffer_destroy( buffer );
    
-   if ( bufferRemote )
+   if ( binfo )
    {
-      wl_buffer_send_release( bufferRemote );
+      struct wl_resource *bufferRemote= binfo->bufferRemote;
+      std::map<struct wl_surface*,WstNestedSurfaceInfo*>::iterator it= binfo->nc->surfaceInfoMap.find( binfo->surface );
+      if ( it != binfo->nc->surfaceInfoMap.end() )
+      {
+         WstNestedSurfaceInfo *surfaceInfo= it->second;
+         surfaceInfo->buffer= 0;
+         if ( bufferRemote )
+         {
+            WstNestedBufferInfo bufferInfo;
+            bufferInfo.surface= binfo->surface;
+            bufferInfo.bufferRemote= bufferRemote;
+            pthread_mutex_lock( &binfo->nc->buffersToReleaseMutex );
+            binfo->nc->buffersToRelease.push_back( bufferInfo );
+            pthread_mutex_unlock( &binfo->nc->buffersToReleaseMutex );
+         }
+      }
+      free(binfo);
    }
 }
 
@@ -864,7 +1110,21 @@ void WstNestedConnectionAttachAndCommitDevice( WstNestedConnection *nc,
       {
          if ( bufferRemote )
          {
-            wl_buffer_add_listener( buffer, &wl_buffer_listener, bufferRemote );
+            bufferInfo *binfo= (bufferInfo*)malloc( sizeof(bufferInfo) );
+            if ( binfo )
+            {
+               binfo->nc= nc;
+               binfo->surface= surface;
+               binfo->bufferRemote= bufferRemote;
+               wl_buffer_add_listener( buffer, &wl_buffer_listener, binfo );
+
+               std::map<struct wl_surface*,WstNestedSurfaceInfo*>::iterator it= nc->surfaceInfoMap.find( surface );
+               if ( it != nc->surfaceInfoMap.end() )
+               {
+                  WstNestedSurfaceInfo *surfaceInfo= it->second;
+                  surfaceInfo->buffer= buffer;
+               }
+            }
          }
          wl_surface_attach( surface, buffer, 0, 0 );
          wl_surface_damage( surface, x, y, width, height);
@@ -878,6 +1138,52 @@ void WstNestedConnectionAttachAndCommitDevice( WstNestedConnection *nc,
       #endif
    }
 }                                               
+
+void WstNestedConnectionAttachAndCommitClone( WstNestedConnection *nc,
+                                              struct wl_surface *surface,
+                                              struct wl_resource *bufferRemote,
+                                              struct wl_buffer *bufferClone,
+                                              int x,
+                                              int y,
+                                              int width,
+                                              int height )
+{
+   if ( nc && bufferRemote && bufferClone )
+   {
+      bufferInfo *binfo= (bufferInfo*)malloc( sizeof(bufferInfo) );
+      if ( binfo )
+      {
+         binfo->nc= nc;
+         binfo->surface= surface;
+         binfo->bufferRemote= bufferRemote;
+         wl_buffer_add_listener( bufferClone, &wl_buffer_listener, binfo );
+
+         std::map<struct wl_surface*,WstNestedSurfaceInfo*>::iterator it= nc->surfaceInfoMap.find( surface );
+         if ( it != nc->surfaceInfoMap.end() )
+         {
+            WstNestedSurfaceInfo *surfaceInfo= it->second;
+            surfaceInfo->buffer= bufferClone;
+         }
+      }
+      wl_surface_attach( surface, bufferClone, 0, 0 );
+      wl_surface_damage( surface, x, y, width, height);
+      wl_surface_commit( surface );
+      wl_display_flush( nc->display );
+   }
+}
+
+void WstNestedConnectionReleaseRemoteBuffers( WstNestedConnection *nc )
+{
+   pthread_mutex_lock( &nc->buffersToReleaseMutex );
+   while( nc->buffersToRelease.size() )
+   {
+      std::vector<WstNestedBufferInfo>::iterator it= nc->buffersToRelease.begin();
+      struct wl_resource *bufferResource= (*it).bufferRemote;
+      wl_buffer_send_release( bufferResource );
+      nc->buffersToRelease.erase(it);
+   }
+   pthread_mutex_unlock( &nc->buffersToReleaseMutex );
+}
 
 void WstNestedConnectionPointerSetCursor( WstNestedConnection *nc, 
                                           struct wl_surface *surface, 

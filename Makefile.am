@@ -19,7 +19,7 @@
 
 AUTOMAKE_OPTIONS = subdir-objects
 
-SUBDIRS = 
+SUBDIRS =
 AM_CXXFLAGS= \
 	-I$(top_srcdir)/include \
    -I${PKG_CONFIG_SYSROOT_DIR}/$(includedir)/wayland \
@@ -28,8 +28,21 @@ AM_CXXFLAGS= \
 AM_LDFLAGS=$(WAYLANDLIB)
 
 ## --- Configurtion -------
-if !HAVE_GLEW
+if ENABLE_PLATFORM_EMBEDDED
 AM_CXXFLAGS += -DWESTEROS_PLATFORM_EMBEDDED
+endif
+
+if ENABLE_ESSOS
+SUBDIRS += essos
+endif
+
+# add required modules sub directory here
+if ENABLE_MODULES
+SUBDIRS += drm/modules
+endif
+
+if HAVE_EGL
+AM_CXXFLAGS += ${EGL_CFLAGS}
 endif
 
 if HAVE_WAYLAND_EGL
@@ -60,17 +73,19 @@ if ENABLE_WESTEROS_RENDERERGL
 BUILT_SOURCES += libwesteros_render_gl.la
 endif               
 
-if ENABLE_WESTEROS_APP 
-if ENABLE_WESTEROS_TEST
-bin_PROGRAMS = westeros westeros_test
-else
-bin_PROGRAMS = westeros
+bin_PROGRAMS =
+
+if ENABLE_WESTEROS_APP
+bin_PROGRAMS += westeros
 endif
-else
+
 if ENABLE_WESTEROS_TEST
-bin_PROGRAMS = westeros_test
+bin_PROGRAMS += westeros_test
 endif
-endif 
+
+if ENABLE_WESTEROS_PLAYER
+bin_PROGRAMS += westeros_player
+endif
 
 ## --- Sample compositor app -------
 westeros_SOURCES = westeros-main.cpp
@@ -79,10 +94,10 @@ westeros_LDFLAGS= \
    $(AM_LDFLAGS) \
    $(WAYLAND_SERVER_LIBS) \
    -lwesteros_compositor
-if HAVE_GLEW
+if !ENABLE_PLATFORM_EMBEDDED
 westeros_LDFLAGS += -lglut -lGL -lGLEW -lX11 -lEGL
 endif
-if !HAVE_GLEW
+if ENABLE_PLATFORM_EMBEDDED
 westeros_LDFLAGS += -lEGL -lwesteros_gl
 if HAVE_WAYLAND_EGL
 westeros_LDFLAGS += -lGLESv2
@@ -94,12 +109,24 @@ westeros_test_SOURCES = westeros-test.cpp
 westeros_test_LDFLAGS= \
    $(AM_LDFLAGS) \
    $(WAYLAND_CLIENT_LIBS) \
+   $(XKBCOMMON_LIBS) \
+   -lxkbcommon \
    -lwesteros_simpleshell_client \
    $(WSTEGL_LIBS) \
    -lEGL
-if HAVE_GLEW
+if !ENABLE_PLATFORM_EMBEDDED
 westeros_test_LDFLAGS += -lGL -lGLEW
 endif   
+
+## --- Sample player -------
+westeros_player_SOURCES = westeros-player.cpp
+westeros_player_CXXFLAGS = $(AM_CXXFLAGS) $(GST_CFLAGS)
+westeros_player_LDFLAGS= \
+   $(AM_LDFLAGS) \
+   $(GST_LIBS) \
+   $(WAYLAND_CLIENT_LIBS) \
+   $(WSTEGL_LIBS) \
+   -lEGL
 
 ## --- Compositor -------
 lib_LTLIBRARIES = libwesteros_compositor.la \
@@ -112,15 +139,20 @@ endif
 libwesteros_compositor_la_SOURCES = \
    westeros-compositor.cpp \
    westeros-nested.cpp \
-   westeros-render.cpp
+   westeros-render.cpp \
+   protocol/vpc-protocol.c
 libwesteros_compositor_la_include_HEADERS = \
    westeros-compositor.h \
-   westeros-render.h
+   westeros-version.h \
+   westeros-render.h \
+   protocol/vpc-client-protocol.h
 libwesteros_compositor_la_includedir = $(includedir)
+libwesteros_compositor_la_CXXFLAGS = $(AM_CXXFLAGS) -I$(srcdir)/protocol
 libwesteros_compositor_la_LDFLAGS= \
    $(AM_LDFLAGS) \
    $(WAYLAND_SERVER_LIBS) \
    $(WAYLAND_CLIENT_LIBS) \
+   $(WAYLAND_EGL_LIBS) \
    $(XKBCOMMON_LIBS) \
    $(WESTEROS_COMPOSITOR_EXTRA_LIBS) \
    -lxkbcommon \
@@ -143,7 +175,7 @@ endif
 ## --- Renderer: OpenGL -------
 libwesteros_render_gl_la_SOURCES = westeros-render-gl.cpp
 libwesteros_render_gl_la_includedir = $(includedir)
-if HAVE_GLEW
+if !ENABLE_PLATFORM_EMBEDDED
 libwesteros_render_gl_la_LDFLAGS= $(WSTEGL_LIBS) -lEGL -lGL -lGLEW $(WAYLAND_SERVER_LIBS)
 else
 libwesteros_render_gl_la_LDFLAGS= $(WSTEGL_LIBS) -lEGL -lwesteros_gl $(WESTEROS_PLATFORM_LIBS) $(WAYLAND_SERVER_LIBS)
@@ -155,7 +187,7 @@ endif
 ## --- Renderer: Embedded -------
 libwesteros_render_embedded_la_SOURCES = westeros-render-embedded.cpp
 libwesteros_render_embedded_la_includedir = $(includedir)
-if HAVE_GLEW
+if !ENABLE_PLATFORM_EMBEDDED
 libwesteros_render_embedded_la_LDFLAGS= -lEGL -lglut -lGL -lGLEW $(WAYLAND_SERVER_LIBS)
 else
 libwesteros_render_embedded_la_LDFLAGS= $(WSTEGL_LIBS) -lEGL -lwesteros_gl $(WESTEROS_PLATFORM_LIBS) $(WAYLAND_SERVER_LIBS)

@@ -21,9 +21,17 @@
 
 #include "wayland-client.h"
 #include "simpleshell-client-protocol.h"
+#include "vpc-client-protocol.h"
 
 #include <gst/gst.h>
 #include <gst/base/gstbasesink.h>
+
+#define DEFAULT_WINDOW_X (0)
+#define DEFAULT_WINDOW_Y (0)
+#define DEFAULT_WINDOW_WIDTH (1280)
+#define DEFAULT_WINDOW_HEIGHT (720)
+
+#define WESTEROS_UNUSED(x) ((void)(x))
 
 G_BEGIN_DECLS
 
@@ -42,12 +50,20 @@ G_BEGIN_DECLS
 typedef struct _GstWesterosSink GstWesterosSink;
 typedef struct _GstWesterosSinkClass GstWesterosSinkClass;
 
+typedef gboolean (*ProcessPadEvent)(GstWesterosSink *sink, GstPad *pad, GstEvent *event, gboolean *passToDefault);
+
+typedef void* (*MediaCaptureCreateContext)( GstElement *element );
+typedef void (*MediaCaptureDestroyContext)( void *context );
+
+#define PROP_SOC_BASE (100)
+
 #include "westeros-sink-soc.h"
 
 struct _GstWesterosSink
 {
    GstBaseSink parent;
    GstPadEventFunction parentEventFunc;
+   GstPadQueryFunction defaultQueryFunc;
    
    GstPad *peerPad; 
    gboolean rejectPrerollBuffers;
@@ -61,19 +77,37 @@ struct _GstWesterosSink
    
    int srcWidth;
    int srcHeight;
+   int maxWidth;
+   int maxHeight;
 
    int windowX;
    int windowY;
    int windowWidth;
    int windowHeight;
+   bool show;
+   bool windowChange;
+   bool windowSet;
+   bool windowSizeOverride;
    
    bool visible;
    float opacity;
    float zorder;
+   gfloat playbackRate;
+   
+   int transX;
+   int transY;
+   int scaleXNum;
+   int scaleXDenom;
+   int scaleYNum;
+   int scaleYDenom;
+   int outputWidth;
+   int outputHeight;
 
    gboolean videoStarted;
    gboolean startAfterLink;
+   gboolean startAfterCaps;
    gboolean flushStarted;
+   gboolean passCaps;
    
    gboolean eosEventSeen;
    gboolean eosDetected;
@@ -82,6 +116,9 @@ struct _GstWesterosSink
    gint64 currentPTS;
    gint64 position;
    gint64 positionSegmentStart;
+   gint64 prevPositionSegmentStart;
+   gboolean queryPositionFromPeer;
+   const GstSegment* currentSegment;
 
    unsigned segmentNumber;
    
@@ -92,7 +129,16 @@ struct _GstWesterosSink
    struct wl_event_queue *queue;
    struct wl_surface *surface;
    uint32_t surfaceId;
-   
+   struct wl_vpc *vpc;
+   struct wl_vpc_surface *vpcSurface;
+   struct wl_output *output;
+
+   ProcessPadEvent processPadEvent;
+
+   void *mediaCaptureModule;
+   MediaCaptureDestroyContext mediaCaptureDestroyContext;
+   void *mediaCaptureContext;
+
    struct _GstWesterosSinkSoc soc;
 };
 
